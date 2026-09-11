@@ -295,7 +295,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True, help="Path to the config file.")
     parser.add_argument("--sample-dir", type=str, default="samples")
-    parser.add_argument("--per-proc-batch-size", type=int, default=125)
+    parser.add_argument("--per-proc-batch-size", type=int, default=512)
     parser.add_argument("--num-fid-samples", type=int, default=50_000)
     parser.add_argument("--global-seed", type=int, default=0)
     parser.add_argument("--precision", type=str, choices=["fp32", "bf16"], default="fp32")
