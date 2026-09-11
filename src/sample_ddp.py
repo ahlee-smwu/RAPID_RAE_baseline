@@ -27,6 +27,7 @@ from utils.model_utils import instantiate_from_config
 from stage1 import RAE
 from stage2.models import Stage2ModelProtocol
 from stage2.transport import create_transport, Sampler
+from stage2.gmm_prior import GMMPrior, wrap_sampler_with_prior
 from utils.train_utils import parse_configs
 
 
@@ -187,6 +188,31 @@ def main(args):
 
     num_classes = int(misc.get("num_classes", 1000))
     null_label = int(misc.get("null_label", num_classes))
+
+    # RAPID adaptive prior: a model trained with the prior expects its initial
+    # latent to be q0*x0_gmm + (1-q0)*eps, not N(0, I). Sampling such a
+    # checkpoint from plain noise silently mismatches training. Never
+    # renormalise the result (z = z / z.std(...)) -- see docs/rapid_prior.md.
+    prior_cfg = cfg.get("prior", None)
+    prior_cfg = {} if prior_cfg is None else OmegaConf.to_container(prior_cfg, resolve=True)
+    if bool(prior_cfg.get("enable", False)):
+        gmm_prior = GMMPrior(
+            ckpt_path=prior_cfg["ckpt_path"],
+            device=device,
+            lpf_alpha=float(prior_cfg.get("lpf_alpha", 1.0)),
+            use_weight=bool(prior_cfg.get("use_weight", True)),
+            stochastic_assign=bool(prior_cfg.get("stochastic_assign", False)),
+            means_device=str(prior_cfg.get("means_device", "mmap")),
+        )
+        sample_fn = wrap_sampler_with_prior(
+            sample_fn,
+            gmm_prior,
+            q0=float(prior_cfg.get("q0", 0.5)),
+            num_classes=num_classes,
+            null_label=null_label,
+        )
+        if rank == 0:
+            print(f"[RAPID] prior enabled for sampling | q0={prior_cfg.get('q0', 0.5)}")
 
     model_target = model_config.get("target", "stage2")
     model_string_name = str(model_target).split(".")[-1]

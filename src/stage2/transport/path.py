@@ -135,7 +135,90 @@ class ICPlan:
         xt = self.compute_xt(t, x0, x1)
         ut = self.compute_ut(t, x0, x1, xt)
         return t, xt, ut
-    
+
+    # ------------------------------------------------------------------
+    # RAPID adaptive prior (ported from LightningDiT/RAPID).
+    #
+    # TIME-AXIS NOTE -- this is the single most important detail of the port.
+    # In RAPID/LightningDiT the interpolant is
+    #       alpha_t = t, sigma_t = 1 - t   ->  NOISE lives at t = 0,
+    #       xt = t * x1 + (1 - t) * x0,   ut = x1 - x0,
+    # and the GMM injection schedule is w(s) = q0 * exp(-decay_alpha * s).
+    #
+    # In THIS repository the interpolant is reversed (see compute_alpha_t /
+    # compute_sigma_t above):
+    #       alpha_t = 1 - t, sigma_t = t   ->  NOISE lives at t = 1,
+    #       xt = (1 - t) * x1 + t * x0,   ut = x0 - x1.
+    #
+    # Substituting s = 1 - t maps one convention onto the other, so the
+    # schedule must become
+    #       w(t) = q0 * exp(-decay_alpha * (1 - t)),
+    # which peaks at w = q0 on the NOISE end (t = 1) and decays toward the
+    # data end (t = 0), exactly as in RAPID. Copying w(s) = q0*exp(-a*s)
+    # verbatim would inject the GMM into the DATA end instead -- the mirror
+    # image of the intended behaviour. tools/verify_port.py check 3 pins
+    # this equivalence numerically.
+    # ------------------------------------------------------------------
+
+    def gmm_weight_t(self, t, x, q0=0.5, decay_alpha=1.0, schedule="exp"):
+        """GMM injection ratio w(t), broadcast to the shape of ``x``.
+
+        schedule="exp"   -> w(t) = q0 * exp(-decay_alpha * (1 - t))   [w(1) = q0]
+        schedule="const" -> w(t) = q0                                 [t-independent]
+        """
+        t_expand = expand_t_like_x(t, x)
+        if schedule == "const":
+            return th.full_like(t_expand, float(q0))
+        if schedule != "exp":
+            raise NotImplementedError(f"Unknown GMM schedule {schedule}")
+        return q0 * th.exp(-decay_alpha * (1.0 - t_expand))
+
+    def plan_gmm_adaptive(self, t, x0_gmm, x1, q0=0.5, decay_alpha=1.0, eps=None):
+        """Time-adaptive GMM prior on this repo's reversed time axis.
+
+        w(t)       = q0 * exp(-decay_alpha * (1 - t))   # w(t=1, noise end) = q0
+        x0_blended = w * x0_gmm + (1 - w) * eps
+        xt         = (1 - t) * x1 + t * x0_blended
+        ut         = x0_blended - x1
+
+        ``eps`` may be supplied so the caller can reuse the standard-Gaussian
+        draw it already made (avoids a second randn of a 196608-D tensor).
+
+        NOTE: ut omits the dw/dt term, so it is the *approximate* conditional
+        velocity -- identical to the approximation RAPID's plan_gmm_adaptive
+        makes. Use plan_gmm_const for the exact-velocity control.
+        """
+        t_expand = expand_t_like_x(t, x1)
+        w = self.gmm_weight_t(t, x1, q0=q0, decay_alpha=decay_alpha, schedule="exp")
+
+        if eps is None:
+            eps = th.randn_like(x1)
+        x0_blended = w * x0_gmm + (1.0 - w) * eps
+
+        xt = (1.0 - t_expand) * x1 + t_expand * x0_blended
+        ut = x0_blended - x1
+        return t, xt, ut
+
+    def plan_gmm_const(self, t, x0_gmm, x1, q_const=0.5, eps=None):
+        """Control arm: x0_blended does not depend on t.
+
+        Because w is constant, x0_blended is a genuine t-independent endpoint
+        and ut = x0_blended - x1 is the EXACT conditional velocity -- there is
+        no missing dw/dt term. This is the ablation that isolates how much of
+        any gain comes from the adaptive schedule versus from the GMM prior
+        itself.
+        """
+        t_expand = expand_t_like_x(t, x1)
+        w = self.gmm_weight_t(t, x1, q0=q_const, schedule="const")
+
+        if eps is None:
+            eps = th.randn_like(x1)
+        x0_blended = w * x0_gmm + (1.0 - w) * eps
+
+        xt = (1.0 - t_expand) * x1 + t_expand * x0_blended
+        ut = x0_blended - x1
+        return t, xt, ut
+
 
 class VPCPlan(ICPlan):
     """class for VP path flow matching"""

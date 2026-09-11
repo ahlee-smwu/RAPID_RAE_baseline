@@ -8,3 +8,5 @@ omegaconf==2.3.0
 numpy==1.26.0
 torchmetrics
 torch-fidelity
+scikit-learn  # RAPID adaptive prior: GMM fitting (src/fit_gmm_rae.py)
+scipy  # RAPID adaptive prior: optional within-class OT matching
