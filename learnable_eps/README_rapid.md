@@ -119,8 +119,6 @@ output), not images — that is the one structural difference from
 `src/train.py`, and the reason `--latent-path` replaces `--data-path`.
 
 ```bash
-export EXPERIMENT_NAME="exp1_rapid_q0.5_S"
-
 torchrun --standalone --nnodes=1 --nproc_per_node=8 \
   learnable_eps/train.py \
   --config learnable_eps/configs/DiTDH-S_DINOv2-B_rapid.yaml \
@@ -131,11 +129,21 @@ torchrun --standalone --nnodes=1 --nproc_per_node=8 \
   --global-seed 42
 ```
 
+**Run name** resolves as `--experiment-name` > `training.experiment_name` in
+the config > `$EXPERIMENT_NAME`, and decides `<results-dir>/<name>/`. Each
+config ships with a name, so no environment variable is needed. Reusing a name
+**auto-resumes** that directory, so give every variant its own:
+
+```bash
+# same config, different variant -> different name, or it continues the old run
+--experiment-name exp2_rapid_q0.3_S
+```
+
 Three gotchas that are not in the README at repo root:
 
 1. **`--compile` is mandatory** — `train.py` raises `NotImplementedError` without it.
-2. **`EXPERIMENT_NAME` is mandatory**, and reusing a name auto-resumes. Use a
-   fresh name per experiment.
+2. **A run name is mandatory** (config, flag, or env — see above), and reusing
+   one auto-resumes. Use a fresh name per experiment.
 3. **The `eval:` block's paths are opened at startup.** If
    `data/imagenet/val/` does not exist the run dies immediately; fix the paths
    or delete the block.
@@ -166,6 +174,8 @@ Sampling it from `N(0,I)` silently mismatches training.
 ---
 
 ## 4. Experiment matrix
+
+Every variant below needs its own `experiment_name`.
 
 | # | Setting | Purpose | Required |
 |---|---|---|---|

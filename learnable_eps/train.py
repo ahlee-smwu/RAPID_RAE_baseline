@@ -111,6 +111,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compile", action="store_true", help="Use torch compile (for rae.encode and model.forward).")
     parser.add_argument("--ckpt", type=str, default=None, help="Optional checkpoint path to resume training.")
     parser.add_argument("--global-seed", type=int, default=None, help="Override training.global_seed from the config.")
+    parser.add_argument("--experiment-name", type=str, default=None,
+                        help="Run name; checkpoints and logs go to <results-dir>/<name>/. "
+                             "Overrides training.experiment_name in the config and the "
+                             "EXPERIMENT_NAME environment variable.")
     args = parser.parse_args()
     return args
 def main():
@@ -228,7 +232,27 @@ def main():
     t_min = float(guidance_value("t_min", 0.0))
     t_max = float(guidance_value("t_max", 1.0))
     
+    # Experiment name: --experiment-name > config training.experiment_name > $EXPERIMENT_NAME.
+    # src/utils/resume_utils.configure_experiment_dirs reads it from the environment
+    # and that file is baseline code we do not modify, so resolve here and export.
+    experiment_name = (
+        args.experiment_name
+        or training_cfg.get("experiment_name")
+        or os.environ.get("EXPERIMENT_NAME")
+    )
+    if not experiment_name:
+        raise ValueError(
+            "No experiment name. Set training.experiment_name in the config, pass "
+            "--experiment-name, or export EXPERIMENT_NAME."
+        )
+    os.environ["EXPERIMENT_NAME"] = str(experiment_name)
+
     experiment_dir, checkpoint_dir, logger = configure_experiment_dirs(args, rank)
+    if rank == 0:
+        # Reusing a name AUTO-RESUMES from that directory's latest checkpoint.
+        # Give every experiment its own name, or a variant will silently
+        # continue the previous run instead of starting fresh.
+        logger.info(f"[run] experiment_name={experiment_name} -> {experiment_dir}")
     
     #### Model init
     rae: RAE = instantiate_from_config(rae_config).to(device)

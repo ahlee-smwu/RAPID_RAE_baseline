@@ -68,6 +68,11 @@ eval:
 
 
 training:
+  # Run name -> <results-dir>/<experiment_name>/. Overridden by --experiment-name,
+  # and falls back to $EXPERIMENT_NAME if unset here.
+  # WARNING: reusing a name AUTO-RESUMES that run. Change it for every variant
+  # (q0, schedule, lpf_alpha, ...) or the new run silently continues the old one.
+  experiment_name: exp1_rapid_q0.5_S
   epochs: 1400
   #batch_size: 32
   global_batch_size: 1024
