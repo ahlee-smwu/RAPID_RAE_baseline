@@ -109,18 +109,33 @@ class ShardedLatentDataset(Dataset):
                 scale = np.load(gdir / "channel_scale.npy").reshape(-1, 1, 1).astype(np.float32)
 
             n_before = len(self.mmaps)
-            rank = 0
-            while (gdir / f"latents_rank{rank:03d}.dat").exists():
-                labels = np.load(gdir / f"labels_rank{rank:03d}.npy")
+            # Iterate the rank count meta.json declares rather than probing for
+            # .dat files: extract_z.py preallocates latents_rank{R}.dat at full
+            # size BEFORE its encode loop and writes labels/global_index only
+            # after the loop finishes, so a .dat on its own proves nothing --
+            # a rank that died early leaves a full-size, zero-filled one.
+            for r in range(int(meta["world_size"])):
+                dat = gdir / f"latents_rank{r:03d}.dat"
+                lab = gdir / f"labels_rank{r:03d}.npy"
+                gix = gdir / f"global_index_rank{r:03d}.npy"
+                missing = [f.name for f in (dat, lab, gix) if not f.exists()]
+                if missing:
+                    raise FileNotFoundError(
+                        f"{gdir}: rank {r} of {meta['world_size']} is incomplete "
+                        f"(missing {', '.join(missing)}).\n"
+                        f"extract_z.py writes labels_rank{r:03d}.npy only after that rank "
+                        f"finishes, so this shard never completed and its .dat is "
+                        f"zero-filled. Training on it would feed the model empty latents.\n"
+                        f"Run: python learnable_eps/check_latents.py --latent-path {self.out_dir}"
+                    )
+                labels = np.load(lab)
                 self.mmaps.append(np.memmap(
-                    gdir / f"latents_rank{rank:03d}.dat",
-                    dtype=np_dtype, mode="r",
+                    dat, dtype=np_dtype, mode="r",
                     shape=(labels.shape[0], *self.latent_shape),
                 ))
                 self.labels.append(labels)
-                self.global_index.append(np.load(gdir / f"global_index_rank{rank:03d}.npy"))
+                self.global_index.append(np.load(gix))
                 self.shard_scale.append(scale)
-                rank += 1
 
             if len(self.mmaps) == n_before:
                 raise FileNotFoundError(f"No latents_rank*.dat shards under {gdir}")

@@ -102,6 +102,21 @@ first thing to try — and `fit_gmm_rae.py` can do that without re-extracting.
 
 ## 3. Running it
 
+### Check the latent extraction first (no GPU, seconds)
+
+```bash
+python learnable_eps/check_latents.py --latent-path /mnt/aisha/ahlee-rae
+```
+
+`extract_z.py` preallocates `latents_rank{R}.dat` at full size **before** its
+encode loop and writes `labels_rank{R}.npy` only **after** it finishes. A rank
+that dies early therefore leaves a full-size, zero-filled `.dat` with no labels
+beside it — neither the file's presence nor its size tells you anything. This
+script checks every group/rank and names the ones that need re-extracting.
+Re-run the **whole group** with the same `--nproc_per_node` as the original:
+the per-rank split comes from a DistributedSampler, so it only reproduces when
+the same world_size runs together.
+
 ### Gate A (no GPU, ~1 s)
 
 ```bash
