@@ -298,6 +298,10 @@ def main():
     loader, sampler = prepare_latent_dataloader(
         args.latent_path, micro_batch_size, num_workers, rank, world_size, seed=global_seed
     )
+    if rank == 0:
+        # Says how many groups/shards were actually picked up. A grouped
+        # extraction (group000/, group001/, ...) must show every group here.
+        logger.info(f"[data] {args.latent_path}: {loader.dataset.describe()}")
     if do_eval:
         eval_dataset = ImageFolder(
             str(eval_data),

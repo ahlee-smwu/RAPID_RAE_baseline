@@ -32,48 +32,123 @@ from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 
 
+def discover_groups(latent_dir) -> List[Path]:
+    """Directories that each hold one meta.json plus their own rank shards.
+
+    Handles both extract_z.py layouts transparently:
+      grouped   -- <out_dir>/group000/, group001/, ...   (--classes-per-group)
+      ungrouped -- <out_dir>/ itself
+
+    Same discovery rule as gmm_fit.py's discover_groups, so the loader and the
+    GMM fit always see the same set of shards.
+    """
+    latent_dir = Path(latent_dir)
+    group_metas = sorted(latent_dir.glob("group*/meta.json"))
+    if group_metas:
+        return [m.parent for m in group_metas]
+    if (latent_dir / "meta.json").exists():
+        return [latent_dir]
+    raise FileNotFoundError(
+        f"No meta.json found directly under {latent_dir} or under {latent_dir}/group*/ -- "
+        f"is this really an extract_z.py --out-dir?"
+    )
+
+
+_NP_DTYPE = {"fp16": np.float16, "bf16": np.float32, "fp32": np.float32, "int8": np.int8}
+
+
 class ShardedLatentDataset(Dataset):
+    """Flat, randomly-indexable view over every shard of an extraction.
+
+    Class-group extractions write one independent sub-directory per group, each
+    with its own meta.json, rank shards and (for int8) channel_scale.npy. They
+    are concatenated here into a single dataset, so a group boundary is
+    invisible to the sampler and each epoch still shuffles across all classes.
+
+    Labels are stored as GLOBAL class ids: extract_z.py wraps the full
+    ImageFolder in a Subset, which passes the underlying target through
+    unchanged, so a grouped extraction still records 0..999 and needs no
+    remapping.
+    """
+
     def __init__(self, out_dir: str | Path):
         self.out_dir = Path(out_dir)
-        with open(self.out_dir / "meta.json") as f:
-            self.meta = json.load(f)
-
-        self.latent_shape: Tuple[int, ...] = tuple(self.meta["latent_shape"])
-        stored_dtype = self.meta["dtype"]
-        np_dtype = {"fp16": np.float16, "bf16": np.float32, "fp32": np.float32, "int8": np.int8}[stored_dtype]
-        self.is_quantized = stored_dtype == "int8"
-        self.channel_scale = None
-        if self.is_quantized:
-            # shape (C,) -> reshape for broadcasting against (C, H, W) latents
-            self.channel_scale = np.load(self.out_dir / "channel_scale.npy").reshape(-1, 1, 1).astype(np.float32)
+        self.group_dirs = discover_groups(self.out_dir)
 
         self.mmaps: List[np.memmap] = []
         self.labels: List[np.ndarray] = []
         self.global_index: List[np.ndarray] = []
+        self.shard_scale: List[np.ndarray | None] = []   # per shard: int8 dequant scale or None
 
-        rank = 0
-        while (self.out_dir / f"latents_rank{rank:03d}.dat").exists():
-            n_in_shard = np.load(self.out_dir / f"labels_rank{rank:03d}.npy").shape[0]
-            mm = np.memmap(
-                self.out_dir / f"latents_rank{rank:03d}.dat",
-                dtype=np_dtype,
-                mode="r",
-                shape=(n_in_shard, *self.latent_shape),
-            )
-            self.mmaps.append(mm)
-            self.labels.append(np.load(self.out_dir / f"labels_rank{rank:03d}.npy"))
-            self.global_index.append(np.load(self.out_dir / f"global_index_rank{rank:03d}.npy"))
-            rank += 1
+        self.latent_shape: Tuple[int, ...] | None = None
+        stored_dtype = None
+        self.meta = None
+        expected_total = 0
 
-        if not self.mmaps:
-            raise FileNotFoundError(f"No shards found under {self.out_dir}")
+        for gdir in self.group_dirs:
+            with open(gdir / "meta.json") as f:
+                meta = json.load(f)
+            if self.meta is None:
+                self.meta = meta
+
+            g_shape = tuple(meta["latent_shape"])
+            g_dtype = meta["dtype"]
+            if self.latent_shape is None:
+                self.latent_shape, stored_dtype = g_shape, g_dtype
+            elif g_shape != self.latent_shape or g_dtype != stored_dtype:
+                # Mixing shapes or dtypes would silently corrupt the batch.
+                raise ValueError(
+                    f"{gdir.name}: latent_shape/dtype {g_shape}/{g_dtype} does not match "
+                    f"{self.latent_shape}/{stored_dtype} from {self.group_dirs[0].name}."
+                )
+
+            np_dtype = _NP_DTYPE[g_dtype]
+            scale = None
+            if g_dtype == "int8":
+                # Calibrated per group, so it must be applied per group.
+                scale = np.load(gdir / "channel_scale.npy").reshape(-1, 1, 1).astype(np.float32)
+
+            n_before = len(self.mmaps)
+            rank = 0
+            while (gdir / f"latents_rank{rank:03d}.dat").exists():
+                labels = np.load(gdir / f"labels_rank{rank:03d}.npy")
+                self.mmaps.append(np.memmap(
+                    gdir / f"latents_rank{rank:03d}.dat",
+                    dtype=np_dtype, mode="r",
+                    shape=(labels.shape[0], *self.latent_shape),
+                ))
+                self.labels.append(labels)
+                self.global_index.append(np.load(gdir / f"global_index_rank{rank:03d}.npy"))
+                self.shard_scale.append(scale)
+                rank += 1
+
+            if len(self.mmaps) == n_before:
+                raise FileNotFoundError(f"No latents_rank*.dat shards under {gdir}")
+
+            got = sum(m.shape[0] for m in self.mmaps[n_before:])
+            if got != meta["total_samples"]:
+                raise ValueError(
+                    f"{gdir.name}: shards hold {got} samples but meta.json expects "
+                    f"{meta['total_samples']}; extraction may be incomplete."
+                )
+            expected_total += int(meta["total_samples"])
+
+        self.is_quantized = stored_dtype == "int8"
+        # Kept for backward compatibility with the single-group layout.
+        self.channel_scale = self.shard_scale[0] if self.shard_scale else None
 
         shard_lens = [m.shape[0] for m in self.mmaps]
-        self._offsets = np.cumsum([0] + shard_lens)  # local dataset-order offsets (not original ImageFolder order)
+        self._offsets = np.cumsum([0] + shard_lens)
         self._total = int(self._offsets[-1])
-        assert self._total == self.meta["total_samples"], (
-            f"Shards contain {self._total} samples but meta.json expects {self.meta['total_samples']}; "
-            "extraction may be incomplete."
+        assert self._total == expected_total, (
+            f"Concatenated {self._total} samples but group metas sum to {expected_total}."
+        )
+
+    def describe(self) -> str:
+        return (
+            f"{self._total} samples, {len(self.mmaps)} shards across "
+            f"{len(self.group_dirs)} group(s) [{', '.join(g.name for g in self.group_dirs)}], "
+            f"latent_shape={self.latent_shape}, dtype={self.meta['dtype']}"
         )
 
     def __len__(self) -> int:
@@ -88,8 +163,9 @@ class ShardedLatentDataset(Dataset):
         shard_id, local_idx = self._locate(idx)
         raw = self.mmaps[shard_id][local_idx]
         label = int(self.labels[shard_id][local_idx])
-        if self.is_quantized:
-            latent = raw.astype(np.float32) * self.channel_scale  # dequantize -> float32, already a fresh copy
+        scale = self.shard_scale[shard_id]
+        if scale is not None:
+            latent = raw.astype(np.float32) * scale  # dequantize -> float32, fresh copy
         else:
             # Always upcast to float32 here, regardless of on-disk storage dtype (fp16/bf16-as-fp32/fp32).
             # This matches what train.py's online `rae.encode(images)` actually returns (fp32, since that
