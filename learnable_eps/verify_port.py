@@ -22,8 +22,10 @@ import sys
 
 import torch
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(REPO, "src"))
+sys.path.insert(0, HERE)
 
 PASS, FAIL = [], []
 
@@ -42,22 +44,60 @@ def load_module(path, name):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--new-path", default=os.path.join(REPO, "src/stage2/transport/path.py"))
-    ap.add_argument("--prior", default=os.path.join(REPO, "src/stage2/gmm_prior.py"))
+    ap.add_argument("--base-path", default=os.path.join(REPO, "src/stage2/transport/path.py"),
+                    help="The UNMODIFIED baseline ICPlan (must stay unmodified).")
+    ap.add_argument("--plans", default=os.path.join(HERE, "rapid_prior/plans.py"))
+    ap.add_argument("--prior", default=os.path.join(HERE, "rapid_prior/gmm_prior.py"))
     ap.add_argument("--old-path", default=None, help="RAPID's transport/path.py, if available.")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
-    new_path = load_module(args.new_path, "rae_path")
-    ICPlan = new_path.ICPlan
-    plan = ICPlan()
+    base_mod = load_module(args.base_path, "rae_path")
+    plans = load_module(args.plans, "rapid_plans")
+    base_plan = base_mod.ICPlan()
+
+    class _PlanAdapter:
+        """Bind the free functions in plans.py to the baseline ICPlan.
+
+        The experiment code deliberately does NOT add methods to the baseline
+        ICPlan, so the checks below reach the GMM plans through this adapter
+        while `plan.compute_alpha_t` etc. still come from the untouched
+        baseline class.
+        """
+        def __getattr__(self, name):
+            return getattr(base_plan, name)
+
+        def gmm_weight_t(self, t, x, **kw):
+            return plans.gmm_weight_t(t, x, **kw)
+
+        def plan_gmm_adaptive(self, t, x0_gmm, x1, **kw):
+            return plans.plan_gmm_adaptive(base_plan, t, x0_gmm, x1, **kw)
+
+        def plan_gmm_const(self, t, x0_gmm, x1, **kw):
+            return plans.plan_gmm_const(base_plan, t, x0_gmm, x1, **kw)
+
+    plan = _PlanAdapter()
 
     B, C, H, W = 4, 8, 16, 16
     x1 = torch.randn(B, C, H, W)
     x0_gmm = torch.randn(B, C, H, W)
     eps = torch.randn(B, C, H, W)
     q0, decay = 0.5, 1.0
+
+    # ------------------------------------------------------------------
+    print("\n== Check 0: the baseline under src/ is untouched ==")
+    # The prior=off control arm is only valid if src/ is the published code.
+    # All experiment code lives under learnable_eps/, so no file in src/ may
+    # mention the prior.
+    import subprocess
+    leaked = subprocess.run(
+        ["grep", "-rIl", "-e", "gmm", "-e", "rapid_prior", "-e", "RAPID",
+         os.path.join(REPO, "src")],
+        capture_output=True, text=True,
+    ).stdout.strip()
+    report("no prior code leaked into src/", leaked == "",
+           "clean" if not leaked else f"found in: {leaked.replace(REPO + '/', '')}")
 
     # ------------------------------------------------------------------
     print("\n== Check 1: RAE interpolant convention (noise at t=1) ==")

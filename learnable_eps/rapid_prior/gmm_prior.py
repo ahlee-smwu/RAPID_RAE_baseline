@@ -1,37 +1,41 @@
 """RAPID adaptive GMM prior for RAE (DINOv2) stage-2 latents.
 
 Ported from the LightningDiT/VA-VAE implementation in the RAPID repository
-(``adaptive-prior/train.py`` : ``get_cluster_gmm`` / ``precompute_sigma_scale`` /
-``lowpass_avg``, and ``adaptive-prior/inference.py`` : the z-blending block).
+(``adaptive-prior/train.py``: ``get_cluster_gmm`` / ``precompute_sigma_scale`` /
+``lowpass_avg``, and ``adaptive-prior/inference.py``: the z-blending block).
 
-Why this is not a copy-paste of the original
---------------------------------------------
-RAE latents are 768x16x16 = 196,608-D, 24x larger than VA-VAE's 32x16x16 =
-8,192-D. The original fitting artefacts do not fit on disk at that width:
+Cost model -- why the checkpoint is split the way it is
+-------------------------------------------------------
+RAE latents are 768x16x16 = 196,608-D, 24x VA-VAE's 8,192-D. The two things
+the prior does have very different costs:
 
-    per-class PCA bases : 1000 x 256 x 196608 x 4B = 201 GB
-    data-space diag var : 1000 x K x 196608 x 4B   =  15.7 GB (K=20)
+  * the POSTERIOR needs all K clusters of a sample's class at once. Doing that
+    in full space would read B*K*D*2B per batch (500 MB at B=64, K=20) -- far
+    too much I/O per step. So it runs in a shared PCA space (d=256), whose
+    tensors are small enough to keep resident on GPU. This is exactly why
+    RAPID had a PCA in the first place: its get_cluster_gmm computes the
+    Mahalanobis distance in PCA space, not data space.
+  * the DRAW needs only the ONE selected cluster: two (B, D) gathers, 50 MB
+    per batch. That is cheap, so it is done in FULL space and stays exact.
 
-So this port changes the storage layout while keeping the arithmetic
-identical:
+Hence: PCA-space tensors (small, GPU-resident) drive assignment; fp16 memmaps
+in full space drive the draw.
 
-  * ONE shared PCA basis ``U`` of shape (d, D) for all classes  -> 201 MB
-  * per-class GMM (means/diag-cov/weights) lives in PCA space   ->  40 MB
-  * data-space diagonal variances are RESTORED ON THE FLY as ``v_k @ U**2``,
-    which is exactly the value the original read out of its precomputed
-    table (see ``precompute_sigma_scale``: ``diag_var_all = v_safe @ U2``)
-  * cluster MEANS stay in full space as an fp16 memmap (K=10 -> 3.9 GB).
-    Means are the one thing that must not be compressed: projecting 1000
-    class means onto a 256-D shared basis would destroy the very class
-    information the prior exists to supply.
+Two checkpoint flavours are accepted, both produced under learnable_eps/:
+
+  ``vars_file`` present  -- exact full-space diagonal variances, as converted
+      from gmm_fit.py's data-space fit (convert_gmm.py). Nothing is
+      approximated in the draw.
+  ``vars_file`` absent   -- variances restored on the fly as ``v_pca @ U**2``
+      (fit_gmm_rae.py's shared-PCA fit). This is the same value RAPID's
+      precompute_sigma_scale built its table from.
 
 Time axis
 ---------
 This repository puts NOISE at t=1 (``alpha_t = 1-t``, ``sigma_t = t``), the
 mirror image of RAPID. The blending schedule therefore reads
-``w(t) = q0 * exp(-decay_alpha * (1-t))``; see the note in
-``stage2/transport/path.py``. This module only builds ``x0_gmm``; the
-schedule itself lives in the path sampler.
+``w(t) = q0 * exp(-decay_alpha * (1-t))``; see ``plans.py``. This module only
+builds ``x0_gmm`` -- the schedule itself lives in the path functions.
 """
 
 from __future__ import annotations
@@ -85,42 +89,37 @@ def estimate_lpf_alpha_minus3db(kernel_size: int = 3) -> float:
         raise NotImplementedError("Only the 3x3 box filter is characterised.")
     # 1-D 3-tap box response at Nyquist (f = 0.5 cycles/sample):
     #   H_box(f) = (1 + 2*cos(2*pi*f)) / 3  ->  H_box(0.5) = -1/3
-    # Separable in 2-D, so the 2-D response at the corner frequency is
-    #   H2 = H_box(0.5)**2 = 1/9
+    # Separable in 2-D, so the 2-D response at the corner frequency is 1/9.
     h_box = (1.0 + 2.0 * math.cos(math.pi)) / 3.0
     h2 = h_box ** 2
-    # Blended filter: H(a) = (1 - a) + a * h2. Solve H(a)**2 = 0.5 (power).
     target = math.sqrt(0.5)
     return (1.0 - target) / (1.0 - h2)
 
 
-# ----------------------------------------------------------------------
-# GMM prior
-# ----------------------------------------------------------------------
+def _open_memmap(path, mode, shape=None):
+    if mode == "mmap":
+        return np.load(path, mmap_mode="r"), None
+    arr = np.load(path)
+    if shape is not None and tuple(arr.shape) != tuple(shape):
+        raise ValueError(f"{path}: shape {arr.shape} != expected {shape}")
+    return None, torch.from_numpy(arr).to(torch.float16)
+
 
 class GMMPrior:
     """Class-conditional GMM prior over RAE latents.
 
-    Checkpoint layout (produced by ``src/fit_gmm_rae.py``)::
+    Checkpoint keys (see convert_gmm.py / fit_gmm_rae.py)::
 
-        {
-          "pca_U":        (d, D) float32   shared PCA basis, orthonormal rows
-          "pca_mean":     (D,)   float32   shared PCA centre
-          "means_pca":    (C, K, d) float32
-          "covs_pca":     (C, K, d) float32   diagonal variances in PCA space
-          "weights":      (C, K)   float32   mixture weights, rows sum to 1
-          "means_file":   str               basename of the fp16 memmap
-          "means_shape":  (C, K, D)
-          "latent_shape": (C_lat, H, W)
-          "num_classes":  int
-          "K":            int
-          "global_sigma_scale": float
-          "latent_mean":  float             diagnostics from the fit
-          "latent_std":   float
-        }
-
-    ``means_file`` is a separate ``.npy`` fp16 memmap because at K=10 it is
-    3.9 GB -- far too large to pickle.
+        pca_U        (d, D) float32    shared PCA basis, orthonormal rows
+        pca_mean     (D,)   float32    shared PCA centre
+        means_pca    (C, K, d) float32
+        covs_pca     (C, K, d) float32 diagonal variances in PCA space
+        weights      (C, K)   float32  mixture weights, rows sum to 1
+        means_file   str               basename of the full-space fp16 memmap
+        means_shape  (C, K, D)
+        vars_file    str  (optional)   full-space diagonal variances, fp16
+        latent_shape (C_lat, H, W)
+        num_classes, K, global_sigma_scale, latent_mean, latent_std
     """
 
     def __init__(
@@ -165,41 +164,48 @@ class GMMPrior:
                 f"PCA basis has D={self.U.shape[1]} but latent_shape implies D={self.D}."
             )
 
-        # U squared, used to restore data-space diagonal variances.
-        self.U2 = self.U * self.U  # (d, D)
-
-        # --- full-space cluster means ---
-        means_path = os.path.join(os.path.dirname(os.path.abspath(ckpt_path)), ckpt["means_file"])
+        base = os.path.dirname(os.path.abspath(ckpt_path))
         means_shape = tuple(int(v) for v in ckpt["means_shape"])
+
+        means_path = os.path.join(base, ckpt["means_file"])
         if not os.path.exists(means_path):
             raise FileNotFoundError(f"Cluster means file not found: {means_path}")
 
-        if means_device == "mmap":
-            # Reads B x D x 2B per batch. MUST live on local SSD -- on NFS this
-            # becomes the training bottleneck.
-            self._means_np = np.load(means_path, mmap_mode="r")
-            self._means_t = None
-        elif means_device == "cpu":
-            # Beware: every rank on the node holds its own copy. Fine for 1-2
-            # ranks, ruinous for 8.
-            self._means_np = None
-            self._means_t = torch.from_numpy(np.load(means_path)).to(torch.float16)
-        elif means_device == "cuda":
-            self._means_np = None
-            self._means_t = torch.from_numpy(np.load(means_path)).to(device=device, dtype=torch.float16)
-        else:
+        if means_device not in ("mmap", "cpu", "cuda"):
             raise ValueError(f"Unknown means_device {means_device!r} (mmap|cpu|cuda)")
 
-        if self._means_t is not None and tuple(self._means_t.shape) != means_shape:
-            raise ValueError(f"means tensor shape {tuple(self._means_t.shape)} != {means_shape}")
+        # mmap: reads (B, D) per gather. MUST live on local SSD -- on NFS this
+        # becomes the training bottleneck.
+        # cpu:  every rank on the node holds its own copy. Fine for 1-2 ranks,
+        #       ruinous for 8.
+        self._means_np, self._means_t = _open_memmap(means_path, means_device, means_shape)
+        if means_device == "cuda" and self._means_t is not None:
+            self._means_t = self._means_t.to(device)
 
+        # Exact full-space diagonal variances, when the fit produced them.
+        self.U2 = None
+        self._vars_np = self._vars_t = None
+        vars_file = ckpt.get("vars_file", None)
+        if vars_file:
+            vars_path = os.path.join(base, vars_file)
+            if not os.path.exists(vars_path):
+                raise FileNotFoundError(f"Cluster variance file not found: {vars_path}")
+            self._vars_np, self._vars_t = _open_memmap(vars_path, means_device, means_shape)
+            if means_device == "cuda" and self._vars_t is not None:
+                self._vars_t = self._vars_t.to(device)
+        else:
+            # No exact table: restore on the fly from the PCA-space variances.
+            self.U2 = self.U * self.U  # (d, D)
+
+        self.exact_vars = vars_file is not None
         self.latent_mean = float(ckpt.get("latent_mean", float("nan")))
         self.latent_std = float(ckpt.get("latent_std", float("nan")))
 
         self._log(
             f"[RAPID prior] classes={self.num_classes} K={self.K} pca_dim={self.d} "
-            f"D={self.D} means_device={means_device} lpf_alpha={self.lpf_alpha} "
-            f"use_weight={self.use_weight} stochastic_assign={self.stochastic_assign} "
+            f"D={self.D} means_device={means_device} exact_vars={self.exact_vars} "
+            f"lpf_alpha={self.lpf_alpha} use_weight={self.use_weight} "
+            f"stochastic_assign={self.stochastic_assign} "
             f"global_sigma_scale={self.global_sigma_scale:.6f} "
             f"fit_latent_mean={self.latent_mean:.4f} fit_latent_std={self.latent_std:.4f}"
         )
@@ -212,40 +218,43 @@ class GMMPrior:
         else:
             print(msg)
 
-    def _gather_means(self, y: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
-        """(B, D) float32 cluster means for the (class, cluster) pairs."""
-        if self._means_t is not None:
-            sel = self._means_t[y.to(self._means_t.device), k.to(self._means_t.device)]
+    def _fp32(self):
+        """Force fp32 regardless of any autocast the caller is inside.
+
+        The PCA projection and the variance handling are matmuls/reductions
+        over a (d, D) basis; under bf16 autocast they lose enough precision to
+        distort the posterior and the recovered sigma. The training loop also
+        disables autocast around the call, but the inference scripts build
+        their latents inside a bf16 block, so the guarantee belongs here.
+        """
+        return torch.amp.autocast(device_type=self.device.type, enabled=False)
+
+    def _gather_full(self, store_np, store_t, y, k):
+        """(B, D) float32 rows for the (class, cluster) pairs."""
+        if store_t is not None:
+            sel = store_t[y.to(store_t.device), k.to(store_t.device)]
             return sel.to(device=self.device, dtype=torch.float32)
-        # memmap path: index on CPU, one contiguous row per sample
         y_np = y.detach().cpu().numpy()
         k_np = k.detach().cpu().numpy()
-        sel = np.stack([self._means_np[int(c), int(j)] for c, j in zip(y_np, k_np)], axis=0)
-        return torch.from_numpy(np.ascontiguousarray(sel)).to(device=self.device, dtype=torch.float32)
-
-    def _restore_diag_var(self, v_pca: torch.Tensor) -> torch.Tensor:
-        """PCA-space diagonal variances -> data-space diagonal variances.
-
-        v_pca: (B, d) -> (B, D) via ``v @ U**2``.
-
-        This is the same arithmetic the original performed when it BUILT its
-        (C, K, D) table (``diag_var_all = v_safe @ U2``); we simply evaluate it
-        per batch instead of storing 15.7 GB.
-        """
-        return torch.clamp(v_pca, min=self.eps) @ self.U2
+        sel = np.stack([store_np[int(c), int(j)] for c, j in zip(y_np, k_np)], axis=0)
+        return torch.from_numpy(np.ascontiguousarray(sel)).to(
+            device=self.device, dtype=torch.float32
+        )
 
     def _posterior(self, x_flat: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        """Responsibility of each of the K clusters for each sample. (B, K)"""
-        means_pca = self.means_pca[y]          # (B, K, d)
-        v = torch.clamp(self.covs_pca[y], min=self.eps)  # (B, K, d)
-        w = self.weights[y]                    # (B, K)
+        """Responsibility of each of the K clusters for each sample. (B, K)
 
-        # Project onto the shared PCA basis.
-        x_pca = (x_flat - self.pca_mean) @ self.U.t()    # (B, d)
+        Computed in the shared PCA space -- see the cost note at module top.
+        """
+        means_pca = self.means_pca[y]                      # (B, K, d)
+        v = torch.clamp(self.covs_pca[y], min=self.eps)    # (B, K, d)
+        w = self.weights[y]                                # (B, K)
 
-        diff = x_pca.unsqueeze(1) - means_pca            # (B, K, d)
-        mahal = (diff * diff / v).sum(dim=2)             # (B, K)
-        log_det = torch.log(v).sum(dim=2)                # (B, K)
+        x_pca = (x_flat - self.pca_mean) @ self.U.t()      # (B, d)
+
+        diff = x_pca.unsqueeze(1) - means_pca              # (B, K, d)
+        mahal = (diff * diff / v).sum(dim=2)               # (B, K)
+        log_det = torch.log(v).sum(dim=2)                  # (B, K)
         log_prob = -0.5 * (mahal + log_det)
         if self.use_weight:
             log_prob = log_prob + torch.log(w + self.eps)
@@ -255,24 +264,18 @@ class GMMPrior:
             posterior = torch.nan_to_num(posterior, nan=1.0 / posterior.shape[1])
         return posterior
 
-    def _fp32(self):
-        """Force fp32 regardless of any autocast the caller is inside.
-
-        The PCA projection and the diagonal-variance restoration are matmuls
-        against a (d, D) basis; under bf16 autocast they lose enough precision
-        to distort the posterior and the recovered sigma. train.py already
-        disables autocast around the training call, but the inference scripts
-        build their latents inside a bf16 autocast block, so the guarantee
-        belongs here rather than at each call site.
-        """
-        return torch.amp.autocast(device_type=self.device.type, enabled=False)
-
-    def _compose(self, y: torch.Tensor, k: torch.Tensor, shape) -> torch.Tensor:
+    def _compose(self, y: torch.Tensor, k: torch.Tensor, shape):
         """Build x0_gmm = LPF(mu) + sigma * randn for the chosen clusters."""
         B = y.shape[0]
-        mu = self._gather_means(y, k)                       # (B, D)
-        v_pca = self.covs_pca[y, k]                         # (B, d)
-        diag_var = self._restore_diag_var(v_pca)            # (B, D)
+        mu = self._gather_full(self._means_np, self._means_t, y, k)      # (B, D)
+
+        if self.exact_vars:
+            diag_var = self._gather_full(self._vars_np, self._vars_t, y, k)
+            diag_var = torch.clamp(diag_var, min=self.eps)
+        else:
+            # v_pca @ U**2 -- the same value RAPID's precomputed table held.
+            diag_var = torch.clamp(self.covs_pca[y, k], min=self.eps) @ self.U2
+
         sigma = torch.sqrt(diag_var + self.eps) * self.global_sigma_scale
 
         mu = mu.view(B, *shape)
@@ -290,10 +293,6 @@ class GMMPrior:
 
         z: (B, C, H, W) the exact tensor the diffusion model is trained on
         y: (B,) class labels
-
-        Runs entirely in fp32 -- the caller is responsible for disabling
-        autocast (PCA projection and diagonal-variance restoration are not
-        numerically safe in bf16).
         """
         with self._fp32():
             z = z.float()
@@ -315,13 +314,13 @@ class GMMPrior:
     def sample_x0_gmm(self, y: torch.Tensor, shape=None) -> torch.Tensor:
         """INFERENCE: draw a cluster from the class's mixture weights.
 
-        No latent is available at sampling time, so the cluster is drawn from
-        the prior mixture weights rather than a posterior.
+        No latent exists at sampling time, so the cluster comes from the prior
+        mixture weights rather than a posterior.
         """
         if shape is None:
             shape = self.latent_shape
         with self._fp32():
-            w = self.weights[y]                              # (B, K)
+            w = self.weights[y]
             k = torch.multinomial(w, num_samples=1).squeeze(1)
             x0_gmm, _ = self._compose(y, k, tuple(shape))
             return x0_gmm
@@ -330,7 +329,7 @@ class GMMPrior:
     def init_latent(self, y: torch.Tensor, shape=None, q0: float = 0.5) -> torch.Tensor:
         """INFERENCE: the initial latent at the noise end (t = 1).
 
-        Must mirror the training blend evaluated at t=1, where
+        Mirrors the training blend evaluated at t=1, where
         ``w(1) = q0 * exp(0) = q0``::
 
             z_init = q0 * x0_gmm + (1 - q0) * eps
@@ -363,8 +362,8 @@ class GMMPrior:
         if getattr(self, "_init_logged", False):
             return
         self._init_logged = True
-        # Record this number: the baseline N(0, I) has var = 1.0, so a value
-        # near 0.5 means the initial latent carries half the usual variance.
+        # Record this. The baseline N(0, I) has var = 1.0; the linear blend
+        # gives Var = q0^2*Var(x0_gmm) + (1-q0)^2, about 0.5 at q0=0.5.
         # Training and inference share the configuration so training is
         # consistent, but the effective SNR differs from baseline and the
         # value belongs in the paper. Below ~0.3, revisit q0.
@@ -387,14 +386,12 @@ def wrap_sampler_with_prior(
 
     ``sample_fn(init, model, **model_kwargs)`` integrates from the noise end
     (t=1) to the data end (t=0), so replacing ``init`` is the whole change --
-    ``src/eval/__init__.py`` needs no modification.
+    ``src/eval`` needs no modification: it already forwards y in model_kwargs.
 
-    The class labels are read from ``model_kwargs['y']``, which
-    ``evaluate_generation_distributed`` already supplies. Under
-    classifier-free guidance ``y`` arrives as ``[y_real; y_null]`` and ``init``
-    is the duplicated ``[z; z]``; the wrapper detects this and builds one
-    prior draw for the real half, then duplicates it so both branches start
-    from the same latent -- which is what the unwrapped code does too.
+    Under classifier-free guidance ``y`` arrives as ``[y_real; y_null]`` and
+    ``init`` as the duplicated ``[z; z]``; the wrapper detects that from the
+    labels and builds one prior draw for the real half, then duplicates it --
+    which is what the unwrapped code does too.
     """
     if prior is None:
         return sample_fn
@@ -416,10 +413,9 @@ def wrap_sampler_with_prior(
         n_init = init.shape[0]
         half = n_init // 2
 
-        # CFG layout: init is [z; z] and y is [y_real; y_null]. Detect it from
-        # the labels (cheap, exact) rather than by comparing the two halves of
-        # a 196608-D tensor. Real labels are 0..num_classes-1, so a trailing
-        # all-null half is unambiguous.
+        # Detect the CFG layout from the labels (cheap, exact) rather than by
+        # comparing two halves of a 196608-D tensor. Real labels are
+        # 0..num_classes-1, so a trailing all-null half is unambiguous.
         is_cfg = (
             n_init % 2 == 0
             and n_init > 0

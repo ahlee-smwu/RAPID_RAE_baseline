@@ -56,6 +56,10 @@ from utils.dist_utils import *
 ##### Eval utils
 from eval import evaluate_generation_distributed
 
+##### experiment code (this directory)
+from latent_dataset import prepare_latent_dataloader
+from rapid_prior import GMMPrior, wrap_sampler_with_prior, training_losses_gmm
+
 def save_checkpoint(
     path: str,
     step: int,
@@ -95,7 +99,11 @@ def load_checkpoint(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train Stage-2 transport model on RAE latents.")
     parser.add_argument("--config", type=str, required=True, help="YAML config containing stage_1 and stage_2 sections.")
-    parser.add_argument("--data-path", type=Path, required=True, help="Directory with ImageFolder structure for training.")
+    parser.add_argument("--latent-path", type=Path, required=True,
+                        help="Directory of pre-extracted RAE latents (extract_z.py --out-dir). "
+                             "This is the parent holding group000/, group001/, ... .")
+    parser.add_argument("--data-path", type=Path, default=None,
+                        help="Unused on the latent path; kept so the baseline CLI still parses.")
     parser.add_argument("--results-dir", type=str, default="ckpts", help="Directory to store training outputs.")
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256, help="Input image resolution.")
     parser.add_argument("--precision", type=str, choices=["fp32", "fp16", "bf16"], default="fp32", help="Compute precision for training.")
@@ -136,6 +144,9 @@ def main():
     sampler_cfg = to_dict(sampler_config)
     guidance_cfg = to_dict(guidance_config)
     training_cfg = to_dict(training_config)
+    # RAPID adaptive prior. Absent / enable=false -> the baseline code path.
+    prior_cfg = to_dict(full_cfg.get("prior", None))
+    prior_enabled = bool(prior_cfg.get("enable", False))
 
     num_classes = int(misc.get("num_classes", 1000))
     null_label = int(misc.get("null_label", num_classes))
@@ -254,11 +265,12 @@ def main():
     
     
     ### Data init
-    stage2_transform = transforms.Compose([
-        transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, args.image_size)),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-    ])
+    # Pre-extracted latents: the stage-2 image transform does not apply here.
+    # NOTE ON AUGMENTATION: extract_z.py deliberately does NOT apply
+    # RandomHorizontalFlip (its latents are a fixed cache), so training from
+    # this loader has NO flip augmentation -- unlike the baseline image path.
+    # The GMM is fitted on the same cache, so prior and data still agree; but
+    # when comparing against an image-path baseline, this is a real difference.
     loader, sampler = prepare_latent_dataloader(
         args.latent_path, micro_batch_size, num_workers, rank, world_size, seed=global_seed
     )
@@ -295,6 +307,42 @@ def main():
         eval_sampler = transport_sampler.sample_sde(**sampler_params)
     else:
         raise NotImplementedError(f"Invalid sampling mode {sampler_mode}.")
+
+    #### RAPID adaptive prior init
+    gmm_prior = None
+    prior_q0 = float(prior_cfg.get("q0", 0.5))
+    prior_decay_alpha = float(prior_cfg.get("decay_alpha", 1.0))
+    prior_schedule = str(prior_cfg.get("schedule", "exp"))
+    if prior_enabled:
+        prior_ckpt = prior_cfg.get("ckpt_path", None)
+        if not prior_ckpt:
+            raise ValueError("prior.enable is true but prior.ckpt_path is not set.")
+        gmm_prior = GMMPrior(
+            ckpt_path=prior_ckpt,
+            device=device,
+            lpf_alpha=float(prior_cfg.get("lpf_alpha", 1.0)),
+            use_weight=bool(prior_cfg.get("use_weight", True)),
+            stochastic_assign=bool(prior_cfg.get("stochastic_assign", False)),
+            means_device=str(prior_cfg.get("means_device", "mmap")),
+            logger=logger if rank == 0 else None,
+        )
+        # Wrapping the sampler swaps only the initial latent, so src/eval does
+        # not need to change: it already forwards y in model_kwargs.
+        eval_sampler = wrap_sampler_with_prior(
+            eval_sampler,
+            gmm_prior,
+            q0=prior_q0,
+            num_classes=num_classes,
+            null_label=null_label,
+            logger=logger if rank == 0 else None,
+        )
+        if rank == 0:
+            logger.info(
+                f"[RAPID] enabled | schedule={prior_schedule} q0={prior_q0} "
+                f"decay_alpha={prior_decay_alpha}"
+            )
+    elif rank == 0:
+        logger.info("[RAPID] disabled | running the unmodified baseline path.")
     
     
     ### Guidance Init
@@ -396,15 +444,35 @@ def main():
                 optimizer,
                 scheduler,
             )
-        for step, (images, labels) in enumerate(loader):
-            images = images.to(device)
-            labels = labels.to(device)
-            with torch.no_grad(): # TODO: wrap this in autocast?
-                z = rae.encode(images)
+        for step, (latents, labels) in enumerate(loader):
+            # The loader already yields rae.encode() output (extract_z.py ran
+            # the same frozen encoder in fp32), so there is NOTHING to encode
+            # here. Calling rae.encode(z) on an already-encoded latent would
+            # be a second encoder pass on the wrong input.
+            z = latents.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
             model_kwargs = dict(y=labels)
-            with autocast(**autocast_kwargs):
-                loss = transport.training_losses(ddp_model, z, model_kwargs)["loss"].mean()
+            if gmm_prior is None:
+                with autocast(**autocast_kwargs):
+                    loss = transport.training_losses(ddp_model, z, model_kwargs)["loss"].mean()
+            else:
+                # Build the prior draw in fp32: the PCA projection and the
+                # variance handling lose too much precision under bf16
+                # autocast. Do not move this inside the autocast block.
+                with autocast(enabled=False), torch.no_grad():
+                    x0_gmm = gmm_prior.build_x0_gmm(z.float(), labels)
+                with autocast(**autocast_kwargs):
+                    loss = training_losses_gmm(
+                        transport,
+                        ddp_model,
+                        z,
+                        x0_gmm,
+                        model_kwargs,
+                        q0=prior_q0,
+                        decay_alpha=prior_decay_alpha,
+                        schedule=prior_schedule,
+                    )["loss"].mean()
             loss.float()
             if scaler:
                 scaler.scale(loss / grad_accum_steps).backward()

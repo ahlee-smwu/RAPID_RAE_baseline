@@ -37,7 +37,6 @@ from omegaconf import OmegaConf
 from stage1 import RAE
 from stage2.models import Stage2ModelProtocol
 from stage2.transport import create_transport, Sampler
-from stage2.gmm_prior import GMMPrior, wrap_sampler_with_prior
 
 ##### general utils
 from utils import wandb_utils
@@ -131,10 +130,6 @@ def main():
     sampler_cfg = to_dict(sampler_config)
     guidance_cfg = to_dict(guidance_config)
     training_cfg = to_dict(training_config)
-    # RAPID adaptive prior. Absent / enable=false -> the baseline code path is
-    # taken verbatim, so baseline comparisons stay exact.
-    prior_cfg = to_dict(full_cfg.get("prior", None))
-    prior_enabled = bool(prior_cfg.get("enable", False))
 
     num_classes = int(misc.get("num_classes", 1000))
     null_label = int(misc.get("null_label", num_classes))
@@ -294,43 +289,6 @@ def main():
         eval_sampler = transport_sampler.sample_sde(**sampler_params)
     else:
         raise NotImplementedError(f"Invalid sampling mode {sampler_mode}.")
-
-    #### RAPID adaptive prior init
-    gmm_prior = None
-    prior_q0 = float(prior_cfg.get("q0", 0.5))
-    prior_decay_alpha = float(prior_cfg.get("decay_alpha", 1.0))
-    prior_schedule = str(prior_cfg.get("schedule", "exp"))
-    prior_ot_within_class = bool(prior_cfg.get("ot_within_class", False))
-    if prior_enabled:
-        prior_ckpt = prior_cfg.get("ckpt_path", None)
-        if not prior_ckpt:
-            raise ValueError("prior.enable is true but prior.ckpt_path is not set.")
-        gmm_prior = GMMPrior(
-            ckpt_path=prior_ckpt,
-            device=device,
-            lpf_alpha=float(prior_cfg.get("lpf_alpha", 1.0)),
-            use_weight=bool(prior_cfg.get("use_weight", True)),
-            stochastic_assign=bool(prior_cfg.get("stochastic_assign", False)),
-            means_device=str(prior_cfg.get("means_device", "mmap")),
-            logger=logger if rank == 0 else None,
-        )
-        # Wrapping the sampler swaps only the initial latent, so src/eval does
-        # not need to change: it already forwards y in model_kwargs.
-        eval_sampler = wrap_sampler_with_prior(
-            eval_sampler,
-            gmm_prior,
-            q0=prior_q0,
-            num_classes=num_classes,
-            null_label=null_label,
-            logger=logger if rank == 0 else None,
-        )
-        if rank == 0:
-            logger.info(
-                f"[RAPID] enabled | schedule={prior_schedule} q0={prior_q0} "
-                f"decay_alpha={prior_decay_alpha} ot_within_class={prior_ot_within_class}"
-            )
-    elif rank == 0:
-        logger.info("[RAPID] disabled | running the unmodified baseline path.")
     
     
     ### Guidance Init
@@ -439,26 +397,8 @@ def main():
                 z = rae.encode(images)
             optimizer.zero_grad(set_to_none=True)
             model_kwargs = dict(y=labels)
-            if gmm_prior is None:
-                with autocast(**autocast_kwargs):
-                    loss = transport.training_losses(ddp_model, z, model_kwargs)["loss"].mean()
-            else:
-                # Build the prior draw in fp32: the PCA projection and the
-                # diagonal-variance restoration lose too much precision under
-                # bf16 autocast. Do not move this inside the autocast block.
-                with autocast(enabled=False), torch.no_grad():
-                    x0_gmm = gmm_prior.build_x0_gmm(z.float(), labels)
-                with autocast(**autocast_kwargs):
-                    loss = transport.training_losses_gmm(
-                        ddp_model,
-                        z,
-                        x0_gmm,
-                        model_kwargs,
-                        q0=prior_q0,
-                        decay_alpha=prior_decay_alpha,
-                        schedule=prior_schedule,
-                        ot_within_class=prior_ot_within_class,
-                    )["loss"].mean()
+            with autocast(**autocast_kwargs):
+                loss = transport.training_losses(ddp_model, z, model_kwargs)["loss"].mean()
             loss.float()
             if scaler:
                 scaler.scale(loss / grad_accum_steps).backward()

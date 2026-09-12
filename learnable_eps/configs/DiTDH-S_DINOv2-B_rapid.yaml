@@ -90,25 +90,26 @@ training:
     base_lr: 2.0e-4
     final_lr: 2.0e-5
     warmup_from_zero: false
+
 # ----------------------------------------------------------------------
 # RAPID adaptive GMM prior.
 #
-# Remove this block (or set enable: false) and the run is bit-for-bit the
-# baseline -- every patch is an added branch, no existing function was
-# altered. That is what makes experiment 0 a valid control.
+# Set enable: false (or drop this block) and the run takes the baseline
+# code path exactly -- src/ is byte-identical to the published baseline,
+# so experiment 0 is a valid control.
 #
-# Produce ckpt_path with src/fit_gmm_rae.py (pca -> fit -> merge).
-# Keep gmm_rae.pkl and means_fp16.npy on LOCAL SSD: in mmap mode training
-# reads B x 196608 x 2B per batch (25 MB at B=64) and NFS will bottleneck it.
+# ckpt_path comes from learnable_eps/convert_gmm.py (reusing an existing
+# gmm_fit.py fit) or learnable_eps/fit_gmm_rae.py (fitting from scratch).
+# Keep gmm_rae.pkl, means_fp16.npy and vars_fp16.npy together on LOCAL SSD:
+# in mmap mode training reads two (B, 196608) fp16 gathers per step.
 # ----------------------------------------------------------------------
 prior:
   enable: true
-  ckpt_path: gmm_out_dinov2b_k10/gmm_rae.pkl
+  ckpt_path: gmm_prior_k20/gmm_rae.pkl
   lpf_alpha: 1.0          # 3x3 box LPF blend, ImageNet setting
   q0: 0.5                 # GMM share at the noise end (t=1)
   decay_alpha: 1.0        # w(t) = q0 * exp(-decay_alpha * (1 - t))
   schedule: exp           # exp | const  (const = exact-velocity control)
   use_weight: true        # fold mixture weights into the posterior
   stochastic_assign: false
-  ot_within_class: false
   means_device: mmap      # mmap | cpu | cuda

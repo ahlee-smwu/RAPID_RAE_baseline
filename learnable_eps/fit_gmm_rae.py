@@ -1,4 +1,12 @@
-"""Fit the RAPID class-conditional GMM prior on RAE (DINOv2) latents.
+"""FALLBACK fitter: fit the RAPID GMM prior from scratch, encoding on the fly.
+
+USE convert_gmm.py INSTEAD if learnable_eps/gmm_fit.py has already been run --
+converting an existing gmm_clusters.pkl takes minutes and reuses the compute
+already spent, whereas this script re-encodes the whole training set.
+
+This script is the route for starting from nothing, or for refitting at a
+different K without re-extracting latents.
+
 
 Run in three stages::
 
@@ -54,7 +62,9 @@ from torchvision.datasets import ImageFolder
 
 import sys
 
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(_ROOT)
+sys.path.append(os.path.join(_ROOT, 'src'))
 
 from stage1 import RAE  # noqa: E402
 from utils.model_utils import instantiate_from_config  # noqa: E402

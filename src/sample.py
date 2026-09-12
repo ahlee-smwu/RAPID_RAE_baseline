@@ -10,9 +10,7 @@ from time import time
 import argparse
 from utils.model_utils import instantiate_from_config
 from stage2.transport import create_transport, Sampler
-from stage2.gmm_prior import GMMPrior, wrap_sampler_with_prior
 from utils.train_utils import parse_configs
-from omegaconf import OmegaConf
 from stage1 import RAE
 from torchvision.utils import save_image
 import torch
@@ -66,28 +64,6 @@ def main(args):
     
     num_classes = misc.get("num_classes", 1000)
     latent_size = misc.get("latent_size", (768, 16, 16))
-
-    # RAPID adaptive prior -- see the note in src/sample_ddp.py.
-    full_cfg = OmegaConf.load(args.config) if isinstance(args.config, str) else args.config
-    prior_cfg = full_cfg.get("prior", None)
-    prior_cfg = {} if prior_cfg is None else OmegaConf.to_container(prior_cfg, resolve=True)
-    if bool(prior_cfg.get("enable", False)):
-        gmm_prior = GMMPrior(
-            ckpt_path=prior_cfg["ckpt_path"],
-            device=device,
-            lpf_alpha=float(prior_cfg.get("lpf_alpha", 1.0)),
-            use_weight=bool(prior_cfg.get("use_weight", True)),
-            stochastic_assign=bool(prior_cfg.get("stochastic_assign", False)),
-            means_device=str(prior_cfg.get("means_device", "mmap")),
-        )
-        sample_fn = wrap_sampler_with_prior(
-            sample_fn,
-            gmm_prior,
-            q0=float(prior_cfg.get("q0", 0.5)),
-            num_classes=int(num_classes),
-            null_label=int(misc.get("null_label", num_classes)),
-        )
-        print(f"[RAPID] prior enabled for sampling | q0={prior_cfg.get('q0', 0.5)}")
     # Labels to condition the model with (feel free to change):
     class_labels = [207, 360]
 
