@@ -1,6 +1,11 @@
 # RAPID adaptive prior — experiment code
 
-> **Running this on the GPU server?** Follow **[RUNBOOK.md](RUNBOOK.md)** —
+> **New Claude Code session on the GPU server?** Start with
+> **[HANDOFF.md](HANDOFF.md)** — the cold-start briefing: what was already
+> done, what is broken, what to ask the user before touching anything, and the
+> decision points at each step.
+>
+> **Running the steps by hand?** Follow **[RUNBOOK.md](RUNBOOK.md)** —
 > a step-by-step procedure with gates for repairing the latent extraction,
 > auditing/repairing the GMM, and launching training. This file is the
 > reference for *why*; the runbook is the *what to type*.
