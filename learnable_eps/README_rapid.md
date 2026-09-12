@@ -1,5 +1,11 @@
 # RAPID adaptive prior — experiment code
 
+> **Running this on the GPU server?** Follow **[RUNBOOK.md](RUNBOOK.md)** —
+> a step-by-step procedure with gates for repairing the latent extraction,
+> auditing/repairing the GMM, and launching training. This file is the
+> reference for *why*; the runbook is the *what to type*.
+
+
 All experiment code lives under `learnable_eps/`. **`src/` is byte-identical to
 the published RAE baseline** — `learnable_eps/verify_port.py` check 0 enforces
 this by grepping `src/` for any prior code. That is what makes the
