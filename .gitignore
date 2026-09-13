@@ -18,3 +18,8 @@ upload_to_hf.py
 /ckpts/
 data
 models
+# RAPID prior checkpoint (16 GB memmaps), GMM pkls, run logs
+/gmm_prior_k20/
+/logs_rapid/
+learnable_eps/gmm_imagenet_256/
+learnable_eps/ckpts/

@@ -60,11 +60,13 @@ misc:
   time_dist_shift_dim: 196608 # 16*16*768
   time_dist_shift_base: 4096
   
-eval:
-  eval_interval: 25000 # every 10 epochs
-  eval_model: true
-  data_path: 'data/imagenet/val/'
-  reference_npz_path: 'data/imagenet/VIRTUAL_imagenet256_labeled.npz'
+# Online FID disabled (data/imagenet/val is not on this server; measure FID
+# offline with sample_ddp.py instead). Re-enable by restoring this block.
+# eval:
+#   eval_interval: 25000 # every 10 epochs
+#   eval_model: true
+#   data_path: 'data/imagenet/val/'
+#   reference_npz_path: 'data/imagenet/VIRTUAL_imagenet256_labeled.npz'
 
 
 training:
@@ -73,11 +75,11 @@ training:
   # WARNING: reusing a name AUTO-RESUMES that run. Change it for every variant
   # (q0, schedule, lpf_alpha, ...) or the new run silently continues the old one.
   experiment_name: exp0_baseline_XL
-  epochs: 1400
-  global_batch_size: 1024
-  grad_accum_steps: 1 # change according to your GPU memory
+  epochs: 80              # 5 GPUs bf16: est. ~1.5 h/epoch; schedule below scaled from 1400 (warmup 40, decay_end 800)
+  global_batch_size: 960   # 5 GPUs: 1024 % 5 != 0; 960 = 5 x 32 x 6 is the closest multiple
+  grad_accum_steps: 6 # 960 / (5 GPUs x 6) = micro batch 32 per GPU under bf16 autocast
   ema_decay: 0.9995
-  num_workers: 16
+  num_workers: 8          # block-window loader: 8 workers x ~1.6 GB block cache per rank
   log_interval: 100
   checkpoint_interval: 10
   sample_every: 10000
@@ -89,8 +91,8 @@ training:
     weight_decay: 0.0
   scheduler:
     type: linear
-    warmup_epochs: 40
-    decay_end_epoch: 800
+    warmup_epochs: 2
+    decay_end_epoch: 46
     base_lr: 2.0e-4
     final_lr: 2.0e-5
     warmup_from_zero: false
@@ -116,4 +118,4 @@ prior:
   schedule: exp           # exp | const  (const = exact-velocity control)
   use_weight: true        # fold mixture weights into the posterior
   stochastic_assign: false
-  means_device: mmap      # mmap | cpu | cuda
+  means_device: cpu       # mmap | cpu | cuda  (no local SSD here; 16 GB RAM per rank)

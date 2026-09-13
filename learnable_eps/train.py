@@ -15,6 +15,7 @@ import logging
 import math
 import os
 from collections import defaultdict, OrderedDict
+from contextlib import nullcontext
 import torch
 # the first flag below was False when we tested this script but True makes A100 training a lot faster:
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -313,9 +314,16 @@ def main():
         logger.info(f"Evaluation dataset loaded from {eval_data}, containing {len(eval_dataset)} images.")
         
     loader_batches = len(loader)
-    if loader_batches % grad_accum_steps != 0:
-        raise ValueError("Number of loader batches must be divisible by grad_accum_steps when drop_last=True.")
+    # src/train.py raises here unless len(loader) % grad_accum_steps == 0,
+    # which for a fixed dataset only holds for lucky (world_size, micro_batch)
+    # pairs. Instead, drop the trailing partial accumulation window each
+    # epoch (the loop below stops at micro_steps_per_epoch), so every
+    # optimizer step sees exactly global_batch_size samples.
     steps_per_epoch = loader_batches // grad_accum_steps
+    micro_steps_per_epoch = steps_per_epoch * grad_accum_steps
+    if rank == 0 and micro_steps_per_epoch != loader_batches:
+        print(f"[data] dropping {loader_batches - micro_steps_per_epoch} trailing micro-batch(es) "
+              f"per epoch so that {loader_batches} batches -> {steps_per_epoch} optimizer steps")
     if steps_per_epoch <= 0:
         raise ValueError("Gradient accumulation configuration results in zero optimizer steps per epoch.")
     
@@ -457,7 +465,7 @@ def main():
         sampler.set_epoch(epoch)
         epoch_metrics: Dict[str, torch.Tensor] = defaultdict(lambda: torch.zeros(1, device=device))
         num_batches = 0
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         accum_counter = 0
         step_loss_accum = 0.0
         if checkpoint_interval > 0 and epoch % checkpoint_interval == 0  and rank == 0:
@@ -473,44 +481,54 @@ def main():
                 scheduler,
             )
         for step, (latents, labels) in enumerate(loader):
+            if step >= micro_steps_per_epoch:
+                break
             # The loader already yields rae.encode() output (extract_z.py ran
             # the same frozen encoder in fp32), so there is NOTHING to encode
             # here. Calling rae.encode(z) on an already-encoded latent would
             # be a second encoder pass on the wrong input.
             z = latents.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
-            optimizer.zero_grad(set_to_none=True)
+            # Gradient accumulation: src/train.py zeroes the grads on EVERY
+            # micro-step and only steps every grad_accum_steps, which throws
+            # away all but the last micro-batch's gradient. Here grads are
+            # only zeroed after an optimizer step, so global_batch_size is the
+            # real effective batch, and DDP's all-reduce is skipped on the
+            # non-boundary micro-steps.
+            is_update_step = (global_step + 1) % grad_accum_steps == 0
             model_kwargs = dict(y=labels)
-            if gmm_prior is None:
-                with autocast(**autocast_kwargs):
-                    loss = transport.training_losses(ddp_model, z, model_kwargs)["loss"].mean()
-            else:
-                # Build the prior draw in fp32: the PCA projection and the
-                # variance handling lose too much precision under bf16
-                # autocast. Do not move this inside the autocast block.
-                with autocast(enabled=False), torch.no_grad():
-                    x0_gmm = gmm_prior.build_x0_gmm(z.float(), labels)
-                with autocast(**autocast_kwargs):
-                    loss = training_losses_gmm(
-                        transport,
-                        ddp_model,
-                        z,
-                        x0_gmm,
-                        model_kwargs,
-                        q0=prior_q0,
-                        decay_alpha=prior_decay_alpha,
-                        schedule=prior_schedule,
-                    )["loss"].mean()
-            loss.float()
-            if scaler:
-                scaler.scale(loss / grad_accum_steps).backward()
-            else:
-                (loss / grad_accum_steps).backward()
-            if clip_grad:
+            sync_ctx = nullcontext() if is_update_step else ddp_model.no_sync()
+            with sync_ctx:
+                if gmm_prior is None:
+                    with autocast(**autocast_kwargs):
+                        loss = transport.training_losses(ddp_model, z, model_kwargs)["loss"].mean()
+                else:
+                    # Build the prior draw in fp32: the PCA projection and the
+                    # variance handling lose too much precision under bf16
+                    # autocast. Do not move this inside the autocast block.
+                    with autocast(enabled=False), torch.no_grad():
+                        x0_gmm = gmm_prior.build_x0_gmm(z.float(), labels)
+                    with autocast(**autocast_kwargs):
+                        loss = training_losses_gmm(
+                            transport,
+                            ddp_model,
+                            z,
+                            x0_gmm,
+                            model_kwargs,
+                            q0=prior_q0,
+                            decay_alpha=prior_decay_alpha,
+                            schedule=prior_schedule,
+                        )["loss"].mean()
+                loss.float()
                 if scaler:
-                    scaler.unscale_(optimizer) 
-                torch.nn.utils.clip_grad_norm_(ddp_model.parameters(), clip_grad)
-            if global_step % grad_accum_steps == 0:
+                    scaler.scale(loss / grad_accum_steps).backward()
+                else:
+                    (loss / grad_accum_steps).backward()
+            if is_update_step:
+                if clip_grad:
+                    if scaler:
+                        scaler.unscale_(optimizer) 
+                    torch.nn.utils.clip_grad_norm_(ddp_model.parameters(), clip_grad)
                 if scaler:
                     scaler.step(optimizer)
                     scaler.update()
@@ -519,6 +537,7 @@ def main():
                 if scheduler is not None:
                     scheduler.step()
                 update_ema(ema_model, ddp_model.module, decay=ema_decay)
+                optimizer.zero_grad(set_to_none=True)
             running_loss += loss.item()
             epoch_metrics['loss'] += loss.detach()
             

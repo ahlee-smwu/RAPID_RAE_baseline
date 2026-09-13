@@ -102,10 +102,18 @@ def check_group(gdir: Path):
 
         rows.append((r, status, detail))
 
-    if ok and total != int(meta["total_samples"]):
+    # extract_z.py uses DistributedSampler(drop_last=False), which pads the
+    # group to a multiple of world_size by repeating its first samples, so the
+    # ranks may legitimately sum to ceil(total/world_size)*world_size.
+    n_total = int(meta["total_samples"])
+    n_padded = -(-n_total // world_size) * world_size
+    if ok and total not in (n_total, n_padded):
         rows.append(("-", "MISMATCH",
-                     f"ranks sum to {total} but meta.json says {meta['total_samples']}"))
+                     f"ranks sum to {total} but meta.json says {n_total}"
+                     f" (or {n_padded} with sampler padding)"))
         ok = False
+    elif ok and total != n_total:
+        rows.append(("-", "ok", f"{total - n_total} padded duplicate(s) from DistributedSampler"))
 
     return meta, rows, ok, total
 
