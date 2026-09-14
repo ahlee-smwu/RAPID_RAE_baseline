@@ -82,6 +82,17 @@ def save_checkpoint(
     torch.save(state, path)
 
 
+def prune_checkpoints(checkpoint_dir: str, keep: int = 2) -> None:
+    """Keep only the newest `keep` epoch checkpoints (ep-NNNNNNN.pt); ep-last.pt is untouched."""
+    epoch_ckpts = []
+    for name in os.listdir(checkpoint_dir):
+        stem = name[len("ep-"):-len(".pt")] if name.startswith("ep-") and name.endswith(".pt") else ""
+        if stem.isdigit():
+            epoch_ckpts.append((int(stem), os.path.join(checkpoint_dir, name)))
+    for _, old in sorted(epoch_ckpts)[:-keep]:
+        os.remove(old)
+
+
 def load_checkpoint(
     path: str,
     model: DDP,
@@ -480,6 +491,7 @@ def main():
                 optimizer,
                 scheduler,
             )
+            prune_checkpoints(checkpoint_dir, keep=int(training_cfg.get("keep_checkpoints", 2)))
         for step, (latents, labels) in enumerate(loader):
             if step >= micro_steps_per_epoch:
                 break
