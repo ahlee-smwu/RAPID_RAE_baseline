@@ -550,7 +550,20 @@ def main():
                     scheduler.step()
                 update_ema(ema_model, ddp_model.module, decay=ema_decay)
                 optimizer.zero_grad(set_to_none=True)
-            running_loss += loss.item()
+            loss_val = loss.item()
+            # Divergence guard: a non-finite loss on ANY rank stops every rank
+            # before the next epoch checkpoint can be written (and before
+            # prune_checkpoints could delete the last healthy one).
+            bad = torch.tensor(float(not math.isfinite(loss_val)), device=device)
+            dist.all_reduce(bad, op=dist.ReduceOp.MAX)
+            if bad.item() > 0:
+                logger.error(
+                    f"[Rank {rank}] non-finite loss ({loss_val}) at epoch {epoch} step {global_step}; "
+                    f"aborting. Resume from the last checkpoint in {checkpoint_dir}."
+                )
+                dist.barrier()
+                raise RuntimeError(f"non-finite training loss at epoch {epoch} step {global_step}")
+            running_loss += loss_val
             epoch_metrics['loss'] += loss.detach()
             
             if log_interval > 0 and global_step % log_interval == 0 and rank == 0:

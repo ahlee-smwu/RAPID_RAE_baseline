@@ -23,3 +23,4 @@ models
 /logs_rapid/
 learnable_eps/gmm_imagenet_256/
 learnable_eps/ckpts/
+/samples_rapid/

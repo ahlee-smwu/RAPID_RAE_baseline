@@ -75,14 +75,14 @@ training:
   # WARNING: reusing a name AUTO-RESUMES that run. Change it for every variant
   # (q0, schedule, lpf_alpha, ...) or the new run silently continues the old one.
   experiment_name: exp1_rapid_q0.5_XL
-  epochs: 80              # 2 GPUs bf16: ~3.7 h/epoch; schedule below scaled from 1400 (warmup 40, decay_end 800)
+  epochs: 80              # 3 GPUs fp32: est. ~4.3 h/epoch; schedule below scaled from 1400 (warmup 40, decay_end 800)
   global_batch_size: 960   # 5 GPUs: 1024 % 5 != 0; 960 = 5 x 32 x 6 is the closest multiple
-  grad_accum_steps: 15 # 960 / (2 GPUs x 15) = micro batch 32 per GPU (bf16); 1280 optimizer steps per epoch
+  grad_accum_steps: 20 # 960 / (3 GPUs x 20) = micro batch 16 per GPU in fp32; 1280 optimizer steps per epoch
   ema_decay: 0.9995
-  num_workers: 10         # must divide the 300 loader windows per rank at world_size=2 (6, 10, 12 work; 8 does not)
+  num_workers: 8          # must divide the loader windows per rank (200 at world_size=3)
   log_interval: 100
-  checkpoint_interval: 1  # every epoch (~3.7 h on 2 GPUs); only the newest keep_checkpoints are kept
-  keep_checkpoints: 2     # older ep-*.pt files are deleted after each save
+  checkpoint_interval: 1  # every epoch; only the newest keep_checkpoints are kept
+  keep_checkpoints: 3     # older ep-*.pt files are deleted after each save
   sample_every: 10000
   clip_grad: 1.0
   global_seed: 42
